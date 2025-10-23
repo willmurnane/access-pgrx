@@ -1,0 +1,6 @@
+comment = 'access_pgrx:  Created by pgrx'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'access_pgrx'
+relocatable = false
+superuser = true
+trusted = false

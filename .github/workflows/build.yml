@@ -1,0 +1,326 @@
+name: Rust
+
+"on":
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+  SCCACHE_VERSION: v0.12.0
+
+jobs:
+  build-linux:
+    strategy:
+      matrix:
+        version: [13, 14, 15, 16, 17, 18]
+        platform: ["ubuntu-24.04", "ubuntu-24.04-arm"]
+      # Continue trying all remaining builds, even if one fails.
+      fail-fast: false
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: /home/runner/.cache/sccache
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up prerequisites and environment
+        run: |
+          sudo apt-get update -y -qq --fix-missing
+          echo "----- Install / Set up sccache -----"
+          mkdir -p $HOME/.local/bin
+          curl -L https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-$(uname -m)-unknown-linux-musl.tar.gz | tar xz
+          mv -f sccache-*/sccache $HOME/.local/bin/sccache
+          chmod +x $HOME/.local/bin/sccache
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          mkdir -p /home/runner/.cache/sccache
+          echo "----- Remove old postgres -----"
+          sudo apt remove -y '^postgres.*' '^libpq.*' '^clang.*' '^llvm.*' '^libclang.*' '^libllvm.*'
+          echo "----- Install system dependencies -----"
+          sudo apt-get install -y \
+            build-essential \
+            llvm-14-dev libclang-14-dev clang-14 \
+            gcc \
+            libssl-dev \
+            libz-dev \
+            make \
+            pkg-config \
+            strace \
+            zlib1g-dev
+      - name: Setup release Postgres apt repo
+        if: matrix.postgres != '19'
+        run: |
+          sudo apt-get install -y wget gnupg
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update -y -qq --fix-missing
+
+      - name: Setup beta Postgres apt repo
+        if: matrix.postgres == '19'
+        run: |
+          sudo apt-get install -y wget gnupg
+          sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 7FCC7D46ACCC4CF8
+          sudo add-apt-repository "deb https://apt.postgresql.org/pub/repos/apt/ $(lsb_release -s -c)-pgdg-snapshot main ${{ matrix.version }}"
+          sudo add-apt-repository "deb https://apt.postgresql.org/pub/repos/apt/ $(lsb_release -s -c)-pgdg main ${{ matrix.version }}"
+          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update -y -qq --fix-missing
+
+      - name: Install Postgres
+        run: |
+          sudo apt-get install -y \
+            postgresql-${{ matrix.version }} \
+            postgresql-server-dev-${{ matrix.version }}
+
+      - name: pg_config details
+        run: |
+          echo ""
+          echo "----- pg_config -----"
+          pg_config
+          echo ""
+
+      - name: Set up PostgreSQL permissions
+        run: sudo chmod a+rwx `/usr/lib/postgresql/${{ matrix.version }}/bin/pg_config --pkglibdir` `/usr/lib/postgresql/${{ matrix.version }}/bin/pg_config --sharedir`/extension /var/run/postgresql/
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        continue-on-error: false
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: pgrx-tests-cargo-${{ runner.os }}-${{ matrix.version }}-${{ hashFiles('**/Cargo.lock', '.github/workflows/tests.yml') }}
+
+      - name: Cache sccache directory
+        uses: actions/cache@v4
+        continue-on-error: false
+        with:
+          path: /home/runner/.cache/sccache
+          key: pgrx-tests-sccache-${{ runner.os }}-${{ matrix.version }}-${{ hashFiles('**/Cargo.lock', '.github/workflows/tests.yml') }}
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      - name: Start sccache server
+        run: sccache --start-server
+
+      - name: Print sccache stats (before)
+        run: sccache --show-stats
+      - name: Install rustfmt & clippy
+        run: |
+          rustup component add rustfmt
+          rustup component add clippy
+
+      - name: Install pgrx
+        run: cargo install cargo-pgrx
+      - name: Pgrx init
+        run: cargo pgrx init --pg${{ matrix.version }} /usr/lib/postgresql/${{ matrix.version }}/bin/pg_config
+      - name: Build
+        run: cargo pgrx package --pg-config /usr/lib/postgresql/${{ matrix.version }}/bin/pg_config
+      - name: Show contents of release folder
+        run: find target/release
+      - name: Tar
+        run: tar -C target/release/access_pgrx-pg${{ matrix.version }} -czvf target/access-pg${{ matrix.version }}-${{ matrix.platform }}.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-pg${{ matrix.version }}-${{ matrix.platform }}
+          path: target/access-pg${{ matrix.version }}-${{ matrix.platform }}.tar.gz
+      - name: Lint
+        run: cargo clippy --features pg${{ matrix.version }} --no-default-features
+      - name: Run rustfmt
+        run: cargo fmt -- --check
+      - name: Print sccache stats (after)
+        run: sccache --show-stats
+      - name: Stop sccache server
+        run: sccache --stop-server || true
+  build_mac:
+    name: MacOS build & test
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: /Users/runner/Library/Caches/Mozilla.sccache
+      SCCACHE_IDLE_TIMEOUT: 0
+
+    strategy:
+      matrix:
+        os: ["macos-15", "macos-15-intel"]
+        version: [13, 14, 15, 16, 17, 18]
+      # Continue trying all remaining builds, even if one fails.
+      fail-fast: false
+    steps:
+      - uses: Homebrew/actions/setup-homebrew@master
+
+      # install postgres with homebrew, but do't let homebrew do an update too.  The update
+      # process not only takes forever, but it tends to fail when the internet changes
+      #       https://github.com/Homebrew/brew/issues/1670#issuecomment-267096602
+      - name: brew install postgresql
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew install ${FORMULA}
+          echo "$(brew --prefix ${FORMULA})/bin" >> $GITHUB_PATH
+        env:
+          FORMULA: postgresql@${{ matrix.version }}
+
+      - uses: actions/checkout@v4
+
+      - name: Set up prerequisites and environment
+        run: |
+          echo "----- Install sccache -----"
+          export arch=$(uname -m)
+          if [[ "$arch" == "arm64" ]]; then
+            export arch=aarch64
+          fi
+          curl -L https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${arch}-apple-darwin.tar.gz | tar xz
+          mv -f sccache-${SCCACHE_VERSION}*/sccache /usr/local/bin
+          rm -rf sccache-${SCCACHE_VERSION}*
+          chmod +x /usr/local/bin/sccache
+          mkdir -p $SCCACHE_DIR
+          sccache --version
+
+          echo "----- Getting pre-installed Postgres major version -----"
+          PG_VER=$(pg_config --version | awk '{split($2,a,"."); print a[1]}')
+          echo "PG_VER=$PG_VER" >> $GITHUB_ENV
+          cat $GITHUB_ENV
+
+          echo "----- Set up Postgres permissions -----"
+          sudo chmod a+rwx `$(which pg_config) --pkglibdir` `$(which pg_config) --sharedir`/extension
+          # ls -lath `$(which pg_config) --pkglibdir` `$(which pg_config) --sharedir`/extension
+          echo "----- Outputting env -----"
+          env
+          echo ""
+
+      - name: Cache sccache directory
+        uses: actions/cache@v4
+        continue-on-error: false
+        with:
+          path: /Users/runner/Library/Caches/Mozilla.sccache
+          key: pgrx-sccache-${{matrix.os}}-${{ hashFiles('**/Cargo.lock', '.github/workflows/tests.yml', '.cargo/config.toml') }}
+
+      - name: Cache cargo directory
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo
+          key: pgrx-cargo-${{matrix.os}}-tests-${{ hashFiles('**/Cargo.lock', '.github/workflows/tests.yml', '.cargo/config.toml') }}
+
+      - name: Start sccache server
+        run: sccache --start-server
+
+      - name: Print sccache stats
+        run: sccache --show-stats
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Install cargo-pgrx
+        run: cargo install cargo-pgrx
+
+      - name: Print sccache stats
+        run: sccache --show-stats
+
+      - name: Run 'cargo pgrx init'
+        run: |
+          set -x
+          cargo pgrx init --pg${{ matrix.version }} $(which pg_config)
+
+      - name: Build release
+        run: cargo pgrx package --features pg${{ matrix.version}} --no-default-features
+      - name: Show contents of release folder
+        run: find target/release
+      - name: Tar
+        run: tar -C target/release/access_pgrx-pg${{ matrix.version }} -czvf target/access-pg${{ matrix.version }}-${{ matrix.os }}.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-pg${{ matrix.version }}-${{ matrix.os }}
+          path: target/access-pg${{ matrix.version }}-${{ matrix.os }}.tar.gz
+
+      - name: Print sccache stats
+        run: sccache --show-stats
+
+      - name: Stop sccache server
+        run: sccache --stop-server || true
+  build-windows:
+    strategy:
+      matrix:
+        version: [13, 14, 15, 16, 17, 18]
+        # TODO pgrx doesn't support "windows-11-arm" yet, and there's no upstream windows-arm binaries from EDB. If that changes, add the other platform here.
+        os: ["windows-2022"]
+      # Continue trying all remaining builds, even if one fails.
+      fail-fast: false
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: /home/runner/.cache/sccache
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up prerequisites and environment
+        run: |
+          Write-Output ""
+
+          echo "----- Install sccache -----"
+          $arch_id = (Get-WMIObject -Class Win32_Processor).Architecture
+          switch ($arch_id) {
+            9 { $arch = "x86_64" }
+            12 { $arch = "aarch64" }
+          }
+          Invoke-WebRequest -Uri "https://github.com/mozilla/sccache/releases/download/${env:SCCACHE_VERSION}/sccache-${env:SCCACHE_VERSION}-${arch}-pc-windows-msvc.tar.gz" -OutFile "sccache.tar.gz"
+          tar -xzvf sccache.tar.gz
+          Move-Item -Force "sccache-*\sccache.exe" -Destination "C:\Windows\System32"
+          New-Item -ItemType Directory -Force -Path $env:SCCACHE_DIR | Out-Null
+          sccache --version
+
+          rustup update
+
+          Write-Output "----- Outputting env -----"
+          Get-ChildItem Env:
+          Write-Output ""
+
+      - name: Cache sccache directory
+        uses: actions/cache@v4
+        continue-on-error: false
+        with:
+          path: C:\Users\runneradmin\sccache
+          key: pgrx-sccache-${{matrix.os}}-${{ hashFiles('**/Cargo.lock', '.github/workflows/tests.yml', '.cargo/config.toml') }}
+
+      - name: Cache cargo directory
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo
+          key: pgrx-cargo-${{matrix.os}}-tests-${{ hashFiles('**/Cargo.lock', '.github/workflows/tests.yml', '.cargo/config.toml') }}
+
+      - name: Start sccache server
+        run: sccache --start-server
+
+      - name: Print sccache stats
+        run: sccache --show-stats
+
+      - name: Install cargo-pgrx
+        run: cargo install cargo-pgrx
+
+      - name: Print sccache stats
+        run: sccache --show-stats
+
+      - name: Run 'cargo pgrx init'
+        run: cargo pgrx init --pg${{ matrix.version }}=download
+
+      - name: Build
+        run: |
+          $pg_config = Get-ChildItem -Path "${env:USERPROFILE}\.pgrx" -Filter "pg_config.exe" -Recurse
+          cargo pgrx package --no-default-features --features pg${{ matrix.version }} --pg-config "${pg_config}"
+      - name: Show contents of release folder
+        run: Get-ChildItem -Path "target/release" -Recurse -File
+      - name: Tar
+        run: tar -C target/release/access_pgrx-pg${{ matrix.version }} -czvf target/access-pg${{ matrix.version }}-${{ matrix.platform }}.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-pg${{ matrix.version }}-${{ matrix.platform }}
+          path: target/access-pg${{ matrix.version }}-${{ matrix.platform }}.tar.gz
+
+      - name: Print sccache stats
+        run: sccache --show-stats
+
+      - name: Stop sccache server
+        run: sccache --stop-server || true
