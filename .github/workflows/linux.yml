@@ -1,0 +1,183 @@
+name: Linux
+
+"on":
+  push:
+    paths:
+      - ".github/workflows/linux.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "access_pgrx.control"
+      - "Dockerfile"
+
+env:
+  CARGO_TERM_COLOR: always
+  SCCACHE_VERSION: v0.12.0
+  BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+
+jobs:
+  build-linux:
+    # if: false
+    strategy:
+      matrix:
+        version: &linux_versions [13, 14, 15, 16, 17, 18]
+        platform: &linux_platforms
+          - "runs_on": "ubuntu-24.04"
+            "arch": "amd64"
+          - "runs_on": "ubuntu-24.04-arm"
+            "arch": "arm64"
+      # Continue trying all remaining builds, even if one fails.
+      fail-fast: false
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: /home/runner/.cache/sccache
+    runs-on: ${{ matrix.platform.runs_on }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up prerequisites and environment
+        run: |
+          sudo apt-get update -y -qq --fix-missing
+          echo "----- Install / Set up sccache -----"
+          mkdir -p $HOME/.local/bin
+          curl -L https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-$(uname -m)-unknown-linux-musl.tar.gz | tar xz
+          mv -f sccache-*/sccache $HOME/.local/bin/sccache
+          chmod +x $HOME/.local/bin/sccache
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          mkdir -p /home/runner/.cache/sccache
+          echo "----- Remove old postgres -----"
+          sudo apt remove -y '^postgres.*' '^libpq.*' '^clang.*' '^llvm.*' '^libclang.*' '^libllvm.*'
+          echo "----- Install system dependencies -----"
+          sudo apt-get install -y \
+            build-essential \
+            llvm-14-dev libclang-14-dev clang-14 \
+            gcc \
+            libssl-dev \
+            libz-dev \
+            make \
+            pkg-config \
+            strace \
+            zlib1g-dev
+      - name: Setup release Postgres apt repo
+        if: matrix.version != '19'
+        run: |
+          sudo apt-get install -y wget gnupg
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update -y -qq --fix-missing
+      - name: Setup beta Postgres apt repo
+        if: matrix.version == '19'
+        run: |
+          sudo apt-get install -y wget gnupg
+          sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 7FCC7D46ACCC4CF8
+          sudo add-apt-repository "deb https://apt.postgresql.org/pub/repos/apt/ $(lsb_release -s -c)-pgdg-snapshot main ${{ matrix.version }}"
+          sudo add-apt-repository "deb https://apt.postgresql.org/pub/repos/apt/ $(lsb_release -s -c)-pgdg main ${{ matrix.version }}"
+          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update -y -qq --fix-missing
+      - name: Install Postgres
+        run: |
+          sudo apt-get install -y \
+            postgresql-${{ matrix.version }} \
+            postgresql-server-dev-${{ matrix.version }}
+      - name: pg_config details
+        run: |
+          echo ""
+          echo "----- pg_config -----"
+          pg_config
+          echo ""
+      - name: Set up PostgreSQL permissions
+        run: sudo chmod a+rwx `/usr/lib/postgresql/${{ matrix.version }}/bin/pg_config --pkglibdir` `/usr/lib/postgresql/${{ matrix.version }}/bin/pg_config --sharedir`/extension /var/run/postgresql/
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        continue-on-error: false
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: pgrx-tests-cargo-${{ runner.os }}-${{ matrix.version }}-${{ hashFiles('**/Cargo.lock', '.github/workflows/linux.yml') }}
+      - name: Cache sccache directory
+        uses: actions/cache@v4
+        continue-on-error: false
+        with:
+          path: /home/runner/.cache/sccache
+          key: pgrx-tests-sccache-${{ runner.os }}-${{ matrix.version }}-${{ hashFiles('**/Cargo.lock', '.github/workflows/linux.yml') }}
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      - name: Start sccache server
+        run: sccache --start-server
+      - name: Print sccache stats (before)
+        run: sccache --show-stats
+      - name: Install rustfmt & clippy
+        run: |
+          rustup component add rustfmt
+          rustup component add clippy
+      - name: Install pgrx
+        run: cargo install cargo-pgrx
+      - name: Pgrx init
+        run: cargo pgrx init --pg${{ matrix.version }} /usr/lib/postgresql/${{ matrix.version }}/bin/pg_config
+      - name: Build
+        run: cargo pgrx package --pg-config /usr/lib/postgresql/${{ matrix.version }}/bin/pg_config
+      - name: Tar
+        run: tar -C target/release/access_pgrx-pg${{ matrix.version }} -czvf target/access-pg${{ matrix.version }}-${{ matrix.platform.arch }}.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: access_pgrx-pg${{ matrix.version }}-${{ matrix.platform.arch }}
+          path: target/access-pg${{ matrix.version }}-${{ matrix.platform.arch }}.tar.gz
+      - name: Lint
+        run: cargo clippy --features pg${{ matrix.version }} --no-default-features
+      - name: Run rustfmt
+        run: cargo fmt -- --check
+      - name: Print sccache stats (after)
+        run: sccache --show-stats
+      - name: Stop sccache server
+        run: sccache --stop-server || true
+
+  build-scratch-container:
+    needs: build-linux
+    strategy:
+      matrix:
+        version: *linux_versions
+      # Continue trying all remaining builds, even if one fails.
+      fail-fast: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v5
+        with:
+          pattern: access_pgrx-pg${{ matrix.version }}-*
+          merge-multiple: true
+      - name: debug
+        run: ls -lR
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          build-args: PG_VER=${{ matrix.version }}
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/pg${{matrix.version}}:${{ env.BRANCH_NAME }}
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME}}/pg${{matrix.version}}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
