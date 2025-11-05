@@ -1,5 +1,7 @@
 ## What is this
 
+[![Linux](https://github.com/willmurnane/access-pgrx/actions/workflows/linux.yml/badge.svg)](https://github.com/willmurnane/access-pgrx/actions/workflows/linux.yml) | [![Macos](https://github.com/willmurnane/access-pgrx/actions/workflows/macos.yml/badge.svg)](https://github.com/willmurnane/access-pgrx/actions/workflows/macos.yml) | [![Windows](https://github.com/willmurnane/access-pgrx/actions/workflows/windows.yml/badge.svg)](https://github.com/willmurnane/access-pgrx/actions/workflows/windows.yml)
+
 This project implements the [accumulo-access specification](https://github.com/apache/accumulo-access/blob/main/SPECIFICATION.md) as [PostgreSQL types](https://www.postgresql.org/docs/current/xtypes.html), using [the pgrx library](https://github.com/pgcentralfoundation/pgrx) to wrap [a Rust implementation of the expression and token types](https://github.com/willmurnane/access-rs).
 
 Artifacts are built for the following platforms:
@@ -26,7 +28,7 @@ Access tokens are strings which represent some particular aspect of access. The 
 - in a system where different departments are not permitted to share certain kinds of data, you might assign one token per department
 - in a system with customer support data, you might have different access tokens to represent data available to tier 1 support, tier 2 support, supervisors, etc.
 
-Tokens composed only of the characters `[a-zA-Z0-9_\-\.:/]` (latin alphabet, numbers, or the characters `_-.:/`) may be expressed without quoting. In addition, any valid sequence of UTF-8 code points may be used as a token, as long as the following algorithm is followed to construct a quoted token:
+Tokens composed only of the characters `[a-zA-Z0-9_\-\.:/]` (latin alphabet, numbers, or the characters `_-.:/`) may be expressed without quoting. In addition, any valid sequence of non-surrogate UTF-8 code points may be used as a token, as long as the following algorithm is followed to construct a quoted token:
 
 - append a double quote `"` to the quoted token
 - for each code point which is to be emitted:
@@ -35,7 +37,7 @@ Tokens composed only of the characters `[a-zA-Z0-9_\-\.:/]` (latin alphabet, num
   - else append the code point
 - finally, append a double quote.
 
-Quoted tokens which may be written as unquoted tokens are equivalent to the unquoted form: `access_evaluate('"a"'::accessexpression, 'a'::accesstokens);` returns true, as does `access_evaluate('a'::accessexpression, '"a"'::accesstokens)`.
+Quoted tokens which may be written as unquoted tokens are equivalent to the unquoted form: `'"a"'::accesstokens` is equal to `'a'::accesstokens`.
 
 Note that tokens are case-sensitive, and do not obey [Unicode equivalence](https://en.wikipedia.org/wiki/Unicode_equivalence) rules: `U&'\006E\0303'` and `U&'\00F1'` are different sequences of code points, and thus are unrelated tokens as far as accumulo access is concerned, despite representing the same character: ñ ñ. Apply appropriate normalization (NFC and/or case folding) externally if necessary.
 
